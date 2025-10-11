@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Сервис безопасности — контроль зоны (исправлено)</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0; padding: 20px;
+      display: flex; flex-direction: column;
+      align-items: center; background: #f4f6f9;
+    }
+    h1 { margin: 6px 0 12px 0; }
+    #wrapper {
+      position: relative;
+      display: inline-block;
+    }
+
+    /* video видимый, canvas прозрачны и накладываются сверху */
+    video {
+      display: block;
+      border: 2px solid #444;
+      border-radius: 6px;
+      background: black; /* запасной фон если видео еще не запустилось */
+      max-width: 100%;
+      height: auto;
+    }
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      border-radius: 6px;
+      /* важное: canvas прозрачный, чтобы не закрывать видео */
+      background: transparent;
+      image-rendering: optimizeQuality;
+    }
+
+    /* overlay для отрисовки детекций (не мешает кликам) */
+    #overlay { pointer-events: none; z-index: 2; }
+
+    /* drawLayer ловит мышь и рисует рамку */
+    #drawLayer { cursor: crosshair; z-index: 3; }
+
+    
+#alertBox {
+  position: fixed;
+  right: 20px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  background: yellow;
+  color: black;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+#alertBox.active {
+  background: red;
+  color: white;
+}
+
+    @keyframes blink {
+      0% { opacity: 1; } 50% { opacity: 0.35; } 100% { opacity: 1; }
+    }
+
+    /* Небольшой отзывчивый контейнер */
+    .controls { margin-top: 10px; font-size: 14px; color: #333; }
+  </style>
+</head>
+<body>
+  <h1>Контроль опасной зоны</h1>
+  <div class="controls">Нарисуйте рамку мышью на видео — это будет зона контроля.</div>
+
+  <div id="wrapper">
+    <video id="video" autoplay playsinline></video>
+    <canvas id="overlay"></canvas>
+    <canvas id="drawLayer"></canvas>
+  </div>
+
+  <div id="alertBox">🚨 ВНИМАНИЕ! Нарушение зоны безопасности!</div>
+
+  <script>
+    const video = document.getElementById('video');
+    const overlay = document.getElementById('overlay');
+    const ctxOverlay = overlay.getContext('2d');
+    const drawLayer = document.getElementById('drawLayer');
+    const ctxDraw = drawLayer.getContext('2d');
+    const alertBox = document.getElementById('alertBox');
+
+    let zone = null;        // зона в координатах internal canvas pixels
+    let drawing = false;
+    let startX = 0, startY = 0;
+
+    // Для анализа движения
+    const hiddenCanvas = document.createElement('canvas');
+    const hiddenCtx = hiddenCanvas.getContext('2d');
+    let lastFrame = null;
+    let lastFullFrame = null;
+
+    // FaceDetector (если есть)
+    let faceDetector = null;
+    if ('FaceDetector' in window) {
+      faceDetector = new FaceDetector({ fastMode: true });
+    } else {
+      console.warn('FaceDetector API не поддерживается этим браузером.');
+    }
+
+    // Синхронизация размеров canvases: internal pixel размеры + CSS размеры,
+    // чтобы mapping между client координатами и canvas координатами был корректен.
+    function syncCanvasSizes() {
+      // Устанавливаем внутренние размеры в соответствии с видео (естественное)
+      const naturalW = video.videoWidth || 640;
+      const naturalH = video.videoHeight || 480;
+
+      // internal pixel size
+      overlay.width = naturalW;
+      overlay.height = naturalH;
+      drawLayer.width = naturalW;
+      drawLayer.height = naturalH;
+      hiddenCanvas.width = naturalW;
+      hiddenCanvas.height = naturalH;
+
+      // CSS size — подгоняем чтобы canvases накладывались точно по видимому видео
+      const vw = video.clientWidth;
+      const vh = video.clientHeight;
+      overlay.style.width = vw + 'px'; overlay.style.height = vh + 'px';
+      drawLayer.style.width = vw + 'px'; drawLayer.style.height = vh + 'px';
+      video.style.maxWidth = '100%';
+    }
+
+    // Перевод координаты мыши в координаты canvas (внутренние пиксели)
+    function getMousePosOnCanvas(canvas, evt) {
+      const rect = canvas.getBoundingClientRect();
+      const xCss = evt.clientX - rect.left;
+      const yCss = evt.clientY - rect.top;
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      return {
+        x: Math.round(xCss * scaleX),
+        y: Math.round(yCss * scaleY)
+      };
+    }
+
+    // Запуск камеры
+    async function startCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+        video.srcObject = stream;
+        video.addEventListener('loadedmetadata', () => {
+          // после загрузки метаданных синхронизируем размеры
+          syncCanvasSizes();
+        });
+        // если меняется размер окна — подгоняем CSS размеры канвасов
+        window.addEventListener('resize', () => {
+          // небольшой таймаут, чтобы layout успел пересчитать размеры
+          requestAnimationFrame(syncCanvasSizes);
+        });
+      } catch (err) {
+        alert('Ошибка доступа к камере: ' + err);
+      }
+    }
+    startCamera();
+
+    // Рисование рамки — используем drawLayer для интерактивности
+    drawLayer.addEventListener('mousedown', (e) => {
+      drawing = true;
+      const pos = getMousePosOnCanvas(drawLayer, e);
+      startX = pos.x; startY = pos.y;
+      // небольшой визуальный индикатор старта
+      ctxDraw.clearRect(0,0,drawLayer.width, drawLayer.height);
+      ctxDraw.fillStyle = 'red';
+      ctxDraw.fillRect(startX - 3, startY - 3, 6, 6);
+    });
+
+    drawLayer.addEventListener('mousemove', (e) => {
+      if (!drawing) return;
+      const pos = getMousePosOnCanvas(drawLayer, e);
+      const w = pos.x - startX;
+      const h = pos.y - startY;
+      ctxDraw.clearRect(0,0,drawLayer.width, drawLayer.height);
+      ctxDraw.strokeStyle = 'red';
+      ctxDraw.lineWidth = 2;
+      ctxDraw.strokeRect(startX, startY, w, h);
+      ctxDraw.fillStyle = 'red';
+      ctxDraw.fillRect(startX - 3, startY - 3, 6, 6);
+    });
+
+    drawLayer.addEventListener('mouseup', (e) => {
+      if (!drawing) return;
+      drawing = false;
+      const pos = getMousePosOnCanvas(drawLayer, e);
+      const x = Math.min(startX, pos.x);
+      const y = Math.min(startY, pos.y);
+      const w = Math.abs(pos.x - startX);
+      const h = Math.abs(pos.y - startY);
+
+      // минимальный размер чтобы не ставить мусор
+      if (w < 5 || h < 5) {
+        // очистим визуал
+        ctxDraw.clearRect(0,0,drawLayer.width, drawLayer.height);
+        zone = null;
+        return;
+      }
+
+      zone = { x, y, w, h };
+      // отобразим рамку на drawLayer (как подтверждение)
+      ctxDraw.clearRect(0,0,drawLayer.width, drawLayer.height);
+      ctxDraw.strokeStyle = 'red';
+      ctxDraw.lineWidth = 2;
+      ctxDraw.strokeRect(zone.x, zone.y, zone.w, zone.h);
+    });
+
+    // Если пользователь выходит за пределы окна с зажатой мышью — тоже завершим рисование
+    window.addEventListener('mouseleave', () => {
+      drawing = false;
+    });
+
+    // Функция пересечения прямоугольников
+    function intersects(r1, r2) {
+      return !(
+        r2.x > r1.x + r1.w ||
+        r2.x + r2.w < r1.x ||
+        r2.y > r1.y + r1.h ||
+        r2.y + r2.h < r1.y
+      );
+    }
+
+    // Основной цикл детекции
+    async function detectLoop() {
+      // очищаем overlay (в нём будем рисовать результат детекции)
+      ctxOverlay.clearRect(0, 0, overlay.width, overlay.height);
+
+      let violation = false;
+
+      if (zone) {
+        // 1) проверка движения: берём кадр всего видео в hiddenCanvas (в internal пикселях)
+        try {
+          hiddenCtx.drawImage(video, 0, 0, hiddenCanvas.width, hiddenCanvas.height);
+        } catch (err) {
+          // если видео ещё не готово — просто ждать
+        }
+
+        // получаем область зоны
+        if (zone.w > 0 && zone.h > 0) {
+          let frame = null;
+          try {
+            frame = hiddenCtx.getImageData(zone.x, zone.y, zone.w, zone.h);
+          } catch (err) {
+            // если зона выходит за пределы (маловероятно) — игнорируем
+            frame = null;
+          }
+
+          if (frame) {
+            if (lastFrame) {
+              // вычисляем среднюю разницу яркости между кадрами
+              let diff = 0;
+              const len = frame.data.length;
+              for (let i = 0; i < len; i += 4) {
+                const avg1 = (frame.data[i] + frame.data[i+1] + frame.data[i+2]) / 3;
+                const avg2 = (lastFrame.data[i] + lastFrame.data[i+1] + lastFrame.data[i+2]) / 3;
+                diff += Math.abs(avg1 - avg2);
+              }
+              const avgDiff = diff / (frame.data.length / 4);
+              // threshold — можно подстраивать
+              if (avgDiff > 18) violation = true;
+            }
+            lastFrame = frame;
+          }
+        }
+
+        // 2) проверка лиц (если доступен FaceDetector)
+        if (faceDetector) {
+          try {
+            // detect возвращает массив лиц с boundingBox в координатах элемента
+            const faces = await faceDetector.detect(video);
+            faces.forEach(face => {
+              const { x, y, width, height } = face.boundingBox || {};
+              // рисуем рамку лица на overlay
+              if (typeof x === 'number') {
+                ctxOverlay.strokeStyle = 'lime';
+                ctxOverlay.lineWidth = 2;
+                ctxOverlay.strokeRect(x, y, width, height);
+
+                if (intersects(zone, { x, y, w: width, h: height })) {
+                  violation = true;
+                }
+              }
+            });
+          } catch (err) {
+            // иногда FaceDetector бросает ошибки — игнорируем
+            // console.error('FaceDetector error:', err);
+          }
+        }
+
+        // отрисовываем красную зону на overlay
+        ctxOverlay.strokeStyle = 'red';
+        ctxOverlay.lineWidth = 2;
+        ctxOverlay.strokeRect(zone.x, zone.y, zone.w, zone.h);
+      } else {
+        // если зоны нет — сбрасываем lastFrame, чтобы не сравнивать старые кадры
+        lastFrame = null;
+      }
+
+      
+      // показываем/скрываем сигнал
+      const wasActive = alertBox.classList.contains('active');
+      alertBox.classList.toggle('active', violation);
+      if (violation && !wasActive) {
+        document.getElementById('alertSound').play();
+      }
+
+      
+      let fullFrame = null;
+      try {
+        hiddenCtx.drawImage(video, 0, 0, hiddenCanvas.width, hiddenCanvas.height);
+        fullFrame = hiddenCtx.getImageData(0, 0, hiddenCanvas.width, hiddenCanvas.height);
+      } catch {}
+
+      if (fullFrame && lastFullFrame) {
+        let motionDetected = false;
+        for (let i = 0; i < fullFrame.data.length; i += 16) { // анализируем каждый 4-й пиксель
+          const avg1 = (fullFrame.data[i] + fullFrame.data[i+1] + fullFrame.data[i+2]) / 3;
+          const avg2 = (lastFullFrame.data[i] + lastFullFrame.data[i+1] + lastFullFrame.data[i+2]) / 3;
+          if (Math.abs(avg1 - avg2) > 25) {
+            const pixelIndex = i / 4;
+            const x = pixelIndex % fullFrame.width;
+            const y = Math.floor(pixelIndex / fullFrame.width);
+            if (zone && x >= zone.x && x <= zone.x + zone.w && y >= zone.y && y <= zone.y + zone.h) {
+              motionDetected = true;
+              break;
+            }
+          }
+        }
+        if (motionDetected) violation = true;
+      }
+      lastFullFrame = fullFrame;
+
+      requestAnimationFrame(detectLoop);
+    }
+
+    detectLoop();
+
+    // Дополнительно: если видео меняет натуральный размер в процессе — синхронизируем canvases
+    // Пример: подключили камеру с разной ориентацией, поэтому слушаем изменения
+    const ro = new ResizeObserver(() => {
+      // при изменении визуального размера (CSS) подгоняем style ширины/высоты canvas,
+      // внутренние размеры остаются равными natural (video.videoWidth/Height).
+      if (video.videoWidth && video.videoHeight) {
+        syncCanvasSizes();
+      }
+    });
+    ro.observe(video);
+
+  </script>
+<audio id="alertSound" src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg" preload="auto"></audio>
+</body>
+</html>
